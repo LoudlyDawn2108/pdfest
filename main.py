@@ -1505,6 +1505,15 @@ class VisualEdgeReader:
                 font=("Arial", 16, "bold")).pack(side=tk.LEFT, padx=20)
         ttk.Button(header, text="+ Add PDF", command=lambda: self._add_book_to_library(library_win)).pack(side=tk.RIGHT, padx=20)
         
+        # Search box
+        search_frame = tk.Frame(library_win, bg="#2d2d30", pady=10)
+        search_frame.pack(fill=tk.X, padx=20)
+        tk.Label(search_frame, text="🔍", bg="#2d2d30", fg="white").pack(side=tk.LEFT)
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(search_frame, textvariable=search_var, bg="#3d3d3d", fg="white",
+                               insertbackground="white", font=("Arial", 11), width=40)
+        search_entry.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        
         # Book list
         list_frame = tk.Frame(library_win, bg="#2d2d30")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
@@ -1521,23 +1530,73 @@ class VisualEdgeReader:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Load books from database
-        books = self.db.get_all_books()
+        # Load all books from database (sorted by recently opened)
+        all_books = self.db.get_all_books()
         
-        if not books:
-            tk.Label(scrollable_frame, text="No books in library.\nClick '+ Add PDF' to add your first book.",
-                    bg="#2d2d30", fg="#888", font=("Arial", 12)).pack(pady=50)
-        else:
-            for book in books:
-                self._create_book_card(scrollable_frame, book, library_win)
+        def refresh_book_list(*args):
+            """Filter and display books based on search query"""
+            # Clear existing cards
+            for widget in scrollable_frame.winfo_children():
+                widget.destroy()
+            
+            query = search_var.get().lower()
+            filtered_books = [b for b in all_books if query in (b['title'] or '').lower() or query in b['path'].lower()]
+            
+            if not filtered_books:
+                if not all_books:
+                    msg = "No books in library.\nClick '+ Add PDF' to add your first book."
+                else:
+                    msg = "No books match your search."
+                tk.Label(scrollable_frame, text=msg, bg="#2d2d30", fg="#888", font=("Arial", 12)).pack(pady=50)
+            else:
+                for book in filtered_books:
+                    self._create_book_card(scrollable_frame, book, library_win)
+        
+        # Bind search to key release
+        search_var.trace_add("write", refresh_book_list)
+        
+        # Initial display
+        refresh_book_list()
     
     def _create_book_card(self, parent, book, library_win):
-        """Create a card for a book in the library"""
+        """Create a card for a book in the library with thumbnail"""
         card = tk.Frame(parent, bg="#3d3d3d", pady=10, padx=15)
         card.pack(fill=tk.X, pady=5)
         
-        # Book info
+        # Generate thumbnail from first page
+        thumbnail_label = None
+        try:
+            if os.path.exists(book['path']):
+                doc = fitz.open(book['path'])
+                if len(doc) > 0:
+                    page = doc.load_page(0)
+                    # Render at low resolution for thumbnail
+                    mat = fitz.Matrix(0.2, 0.2)  # 20% scale
+                    pix = page.get_pixmap(matrix=mat)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    # Resize to fixed height while maintaining aspect ratio
+                    thumb_height = 80
+                    aspect = img.width / img.height
+                    thumb_width = int(thumb_height * aspect)
+                    img = img.resize((thumb_width, thumb_height), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    
+                    thumbnail_label = tk.Label(card, image=photo, bg="#3d3d3d")
+                    thumbnail_label.image = photo  # Keep reference
+                    thumbnail_label.pack(side=tk.LEFT, padx=(0, 15))
+                doc.close()
+        except Exception as e:
+            print(f"Thumbnail error: {e}")
+        
+        # Book info (truncate long titles/paths)
         title = book['title'] or Path(book['path']).stem
+        if len(title) > 50:
+            title = title[:47] + "..."
+        
+        path_display = book['path']
+        if len(path_display) > 60:
+            path_display = "..." + path_display[-57:]
+        
         progress = f"Page {book['last_page'] + 1} of {book['total_pages']}" if book['total_pages'] > 0 else "Not opened yet"
         
         info_frame = tk.Frame(card, bg="#3d3d3d")
@@ -1547,7 +1606,7 @@ class VisualEdgeReader:
                 font=("Arial", 12, "bold"), anchor="w").pack(fill=tk.X)
         tk.Label(info_frame, text=progress, bg="#3d3d3d", fg="#aaa",
                 font=("Arial", 10), anchor="w").pack(fill=tk.X)
-        tk.Label(info_frame, text=book['path'], bg="#3d3d3d", fg="#666",
+        tk.Label(info_frame, text=path_display, bg="#3d3d3d", fg="#666",
                 font=("Arial", 8), anchor="w").pack(fill=tk.X)
         
         # Buttons
@@ -1560,7 +1619,10 @@ class VisualEdgeReader:
                   command=lambda p=book['path'], c=card: self._remove_from_library(p, c)).pack(side=tk.LEFT)
         
         # Make card clickable
-        for widget in [card, info_frame] + list(info_frame.winfo_children()):
+        clickable_widgets = [card, info_frame] + list(info_frame.winfo_children())
+        if thumbnail_label:
+            clickable_widgets.append(thumbnail_label)
+        for widget in clickable_widgets:
             widget.bind("<Button-1>", lambda e, p=book['path']: self._open_from_library(p, library_win))
             widget.configure(cursor="hand2")
     
