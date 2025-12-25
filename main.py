@@ -159,6 +159,7 @@ class VisualEdgeReader:
         self.page_width = 0  # Width of pages at current zoom
         self.sentences = []  # List of PDFSentence objects (global across loaded pages)
         self.current_sentence_idx = 0
+        self.last_highlighted_page = None  # Track which page has highlight for cleanup
         self._is_playing = False  # Backing field for property
         self.stop_signal = False
         self.audio_file = os.path.join(tempfile.gettempdir(), "edge_tts_stream.mp3")
@@ -1063,6 +1064,13 @@ class VisualEdgeReader:
 
         sentence = self.sentences[self.current_sentence_idx]
         page_num = sentence.page_num
+        
+        # Clear highlight from previous page if different
+        if self.last_highlighted_page is not None and self.last_highlighted_page != page_num:
+            self.clear_highlight(self.last_highlighted_page)
+        
+        # Track current highlighted page
+        self.last_highlighted_page = page_num
         
         # Make sure the page is loaded
         if page_num not in self.loaded_pages:
