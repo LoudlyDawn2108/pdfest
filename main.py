@@ -11,7 +11,7 @@ import tempfile
 import sqlite3
 from pathlib import Path
 from datetime import datetime
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageEnhance
 
 # --- Constants ---
 DEFAULT_ZOOM = 2.5
@@ -202,6 +202,9 @@ class VisualEdgeReader:
         # Header/footer margins for TTS (in points, at 1x zoom)
         self.header_margin = float(self.db.get_setting("header_margin", 0))
         self.footer_margin = float(self.db.get_setting("footer_margin", 0))
+        
+        # Brightness filter (0.0-1.0, where 1.0 is normal, lower is dimmer)
+        self.brightness = float(self.db.get_setting("brightness", 1.0))
 
         # Init Audio
         pygame.mixer.init()
@@ -223,6 +226,9 @@ class VisualEdgeReader:
         
         # Margin settings (for TTS exclusion)
         ttk.Button(toolbar, text="📏 Margins", command=self.show_margin_settings).pack(side=tk.LEFT, padx=5)
+        
+        # Brightness control
+        ttk.Button(toolbar, text="🌙 Dim", command=self.show_brightness_settings).pack(side=tk.LEFT, padx=5)
 
         # Playback controls (right side)
         self.btn_play = ttk.Button(toolbar, text="▶ Play", command=self.toggle_play)
@@ -304,7 +310,7 @@ class VisualEdgeReader:
         self.v_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.VERTICAL)
         self.h_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.HORIZONTAL)
 
-        self.canvas = tk.Canvas(self.canvas_frame, bg="#555", 
+        self.canvas = tk.Canvas(self.canvas_frame, bg="#1a1a1a", 
                                 yscrollcommand=self.v_scroll.set, 
                                 xscrollcommand=self.h_scroll.set)
         
@@ -332,6 +338,7 @@ class VisualEdgeReader:
         
         # Keyboard shortcuts for TTS and navigation
         self.root.bind("<p>", lambda e: self.toggle_play())
+        self.root.bind("<space>", lambda e: self.toggle_play())
         self.root.bind("<j>", lambda e: self.scroll_down())
         self.root.bind("<k>", lambda e: self.scroll_up())
         self.root.bind("<h>", lambda e: self.prev_sentence())
@@ -557,7 +564,13 @@ class VisualEdgeReader:
         
         # Create image and store PIL version for highlighting
         img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        self.page_pil_images[page_num] = img_data.copy()  # Store original
+        self.page_pil_images[page_num] = img_data.copy()  # Store original (full brightness)
+        
+        # Apply brightness filter
+        if self.brightness < 1.0:
+            enhancer = ImageEnhance.Brightness(img_data)
+            img_data = enhancer.enhance(self.brightness)
+        
         photo = ImageTk.PhotoImage(img_data)
         self.page_images[page_num] = photo  # Keep reference
         
@@ -1112,6 +1125,11 @@ class VisualEdgeReader:
         # Composite the overlay onto the image
         highlighted_img = Image.alpha_composite(img, overlay).convert("RGB")
         
+        # Apply brightness filter
+        if self.brightness < 1.0:
+            enhancer = ImageEnhance.Brightness(highlighted_img)
+            highlighted_img = enhancer.enhance(self.brightness)
+        
         # Update the page image on canvas
         photo = ImageTk.PhotoImage(highlighted_img)
         self.page_images[page_num] = photo  # Keep reference
@@ -1127,7 +1145,13 @@ class VisualEdgeReader:
         if page_num not in self.page_pil_images:
             return
         
-        img = self.page_pil_images[page_num]
+        img = self.page_pil_images[page_num].copy()
+        
+        # Apply brightness filter
+        if self.brightness < 1.0:
+            enhancer = ImageEnhance.Brightness(img)
+            img = enhancer.enhance(self.brightness)
+        
         photo = ImageTk.PhotoImage(img)
         self.page_images[page_num] = photo
         
@@ -1473,6 +1497,80 @@ class VisualEdgeReader:
                     fill="#ff4444", stipple="gray50", outline="#ff0000",
                     tags="margin_preview"
                 )
+    
+    # --- Brightness settings ---
+    def show_brightness_settings(self):
+        """Show dialog to adjust screen brightness for eye comfort"""
+        bright_win = tk.Toplevel(self.root)
+        bright_win.title("Brightness")
+        bright_win.geometry("350x180")
+        bright_win.configure(bg="#2d2d30")
+        
+        # Header
+        tk.Label(bright_win, text="🌙 Screen Brightness", bg="#2d2d30", fg="white",
+                font=("Arial", 14, "bold")).pack(pady=10)
+        
+        tk.Label(bright_win, text="Lower brightness to reduce eye strain", 
+                bg="#2d2d30", fg="#aaa", font=("Arial", 10)).pack()
+        
+        # Brightness slider
+        slider_frame = tk.Frame(bright_win, bg="#2d2d30")
+        slider_frame.pack(fill=tk.X, padx=20, pady=15)
+        
+        tk.Label(slider_frame, text="🔅", bg="#2d2d30", fg="white", font=("Arial", 14)).pack(side=tk.LEFT)
+        
+        brightness_var = tk.DoubleVar(value=self.brightness)
+        brightness_scale = tk.Scale(slider_frame, from_=0.3, to=1.0, resolution=0.05,
+                                   orient=tk.HORIZONTAL, variable=brightness_var,
+                                   bg="#3d3d3d", fg="white", highlightthickness=0, length=200)
+        brightness_scale.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        
+        tk.Label(slider_frame, text="🔆", bg="#2d2d30", fg="white", font=("Arial", 14)).pack(side=tk.LEFT)
+        
+        def apply_brightness(*args):
+            self.brightness = brightness_var.get()
+            self.db.set_setting("brightness", self.brightness)
+            self.rerender_loaded_pages()
+        
+        brightness_scale.bind("<ButtonRelease-1>", apply_brightness)
+        
+        # Close button
+        ttk.Button(bright_win, text="Close", command=bright_win.destroy).pack(pady=10)
+    
+    def rerender_loaded_pages(self):
+        """Re-render all loaded pages with current brightness"""
+        if not self.doc:
+            return
+        
+        # Store current scroll position
+        scroll_pos = self.canvas.yview()[0]
+        
+        # Re-render each loaded page
+        for page_num in list(self.loaded_pages):
+            page = self.doc.load_page(page_num)
+            mat = fitz.Matrix(self.zoom_level, self.zoom_level)
+            pix = page.get_pixmap(matrix=mat)
+            
+            img_data = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            self.page_pil_images[page_num] = img_data.copy()
+            
+            # Apply brightness
+            if self.brightness < 1.0:
+                enhancer = ImageEnhance.Brightness(img_data)
+                img_data = enhancer.enhance(self.brightness)
+            
+            photo = ImageTk.PhotoImage(img_data)
+            self.page_images[page_num] = photo
+            
+            y_offset = self.page_offsets.get(page_num, page_num * self.estimated_page_height)
+            canvas_width = self.canvas.winfo_width()
+            x_offset = max(0, (canvas_width - pix.width) // 2)
+            
+            self.canvas.delete(f"page_{page_num}")
+            self.canvas.create_image(x_offset, y_offset, image=photo, anchor=tk.NW, tags=f"page_{page_num}")
+        
+        # Restore scroll position
+        self.canvas.yview_moveto(scroll_pos)
     
     # --- Progress saving ---
     def save_current_progress(self):
