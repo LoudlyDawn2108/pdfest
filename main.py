@@ -344,6 +344,8 @@ class VisualEdgeReader:
         self.root.bind("<k>", lambda e: self.scroll_up())
         self.root.bind("<h>", lambda e: self.prev_sentence())
         self.root.bind("<l>", lambda e: self.next_sentence())
+        self.root.bind("<t>", lambda e: self.toggle_sidebar())
+        self.root.bind("<o>", lambda e: self.show_library())
 
     # --- Property for is_playing with auto UI update ---
     @property
