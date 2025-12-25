@@ -63,6 +63,16 @@ class LibraryDB:
             cursor.execute("ALTER TABLE books ADD COLUMN zoom_level REAL DEFAULT 2.5")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        
+        # Add margin columns for per-book TTS exclusion (migration)
+        try:
+            cursor.execute("ALTER TABLE books ADD COLUMN header_margin REAL DEFAULT 50")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE books ADD COLUMN footer_margin REAL DEFAULT 60")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
     
     def get_setting(self, key, default=None):
@@ -90,18 +100,23 @@ class LibraryDB:
         self.conn.commit()
         return cursor.lastrowid
     
-    def update_book_progress(self, path, last_page, last_sentence=0, zoom_level=None):
+    def update_book_progress(self, path, last_page, last_sentence=0, zoom_level=None, header_margin=None, footer_margin=None):
         cursor = self.conn.cursor()
+        updates = ["last_page = ?", "last_sentence = ?", "last_opened = ?"]
+        params = [last_page, last_sentence, datetime.now().isoformat()]
+        
         if zoom_level is not None:
-            cursor.execute('''
-                UPDATE books SET last_page = ?, last_sentence = ?, zoom_level = ?, last_opened = ?
-                WHERE path = ?
-            ''', (last_page, last_sentence, zoom_level, datetime.now().isoformat(), path))
-        else:
-            cursor.execute('''
-                UPDATE books SET last_page = ?, last_sentence = ?, last_opened = ?
-                WHERE path = ?
-            ''', (last_page, last_sentence, datetime.now().isoformat(), path))
+            updates.append("zoom_level = ?")
+            params.append(zoom_level)
+        if header_margin is not None:
+            updates.append("header_margin = ?")
+            params.append(header_margin)
+        if footer_margin is not None:
+            updates.append("footer_margin = ?")
+            params.append(footer_margin)
+        
+        params.append(path)
+        cursor.execute(f"UPDATE books SET {', '.join(updates)} WHERE path = ?", params)
         self.conn.commit()
     
     def get_book(self, path):
@@ -200,9 +215,9 @@ class VisualEdgeReader:
         self.selected_text = ""
         self.selection_rects = []  # List of (page_num, x0, y0, x1, y1) for drawing
         
-        # Header/footer margins for TTS (in points, at 1x zoom)
-        self.header_margin = float(self.db.get_setting("header_margin", 0))
-        self.footer_margin = float(self.db.get_setting("footer_margin", 0))
+        # Header/footer margins for TTS (in points, at 1x zoom) - loaded per-book
+        self.header_margin = 0.0
+        self.footer_margin = 0.0
         
         # Brightness filter (0.0-1.0, where 1.0 is normal, lower is dimmer)
         self.brightness = float(self.db.get_setting("brightness", 1.0))
@@ -394,11 +409,18 @@ class VisualEdgeReader:
         # Load TOC
         self.load_toc()
         
-        # Check for saved zoom level before rendering
+        # Check for saved zoom level and margins before rendering
         book_info = self.db.get_book(filename)
-        if book_info and book_info['zoom_level']:
-            self.zoom_level = book_info['zoom_level']
-            self.lbl_zoom.config(text=f"{int(self.zoom_level * 100)}%")
+        if book_info:
+            if book_info['zoom_level']:
+                self.zoom_level = book_info['zoom_level']
+                self.lbl_zoom.config(text=f"{int(self.zoom_level * 100)}%")
+            # Load per-book margins (default 50/60 for new books)
+            self.header_margin = float(book_info['header_margin'] if book_info['header_margin'] is not None else 50)
+            self.footer_margin = float(book_info['footer_margin'] if book_info['footer_margin'] is not None else 60)
+        else:
+            self.header_margin = 50.0
+            self.footer_margin = 60.0
         
         # Estimate total canvas height based on first page
         first_page = self.doc.load_page(0)
@@ -1412,7 +1434,7 @@ class VisualEdgeReader:
         """Show dialog to configure header/footer margins for TTS"""
         margin_win = tk.Toplevel(self.root)
         margin_win.title("TTS Text Margins")
-        margin_win.geometry("400x250")
+        margin_win.geometry("400x300")
         margin_win.configure(bg="#2d2d30")
         
         # Header
@@ -1453,8 +1475,15 @@ class VisualEdgeReader:
         def apply_margins():
             self.header_margin = header_var.get()
             self.footer_margin = footer_var.get()
-            self.db.set_setting("header_margin", self.header_margin)
-            self.db.set_setting("footer_margin", self.footer_margin)
+            # Save per-book margins
+            if self.current_pdf_path:
+                self.db.update_book_progress(
+                    self.current_pdf_path,
+                    self.get_visible_page(),
+                    self.current_sentence_idx,
+                    header_margin=self.header_margin,
+                    footer_margin=self.footer_margin
+                )
             # Re-analyze sentences for loaded pages
             self.sentences.clear()
             for page_num in self.loaded_pages:
@@ -1513,7 +1542,7 @@ class VisualEdgeReader:
         """Show dialog to adjust screen brightness for eye comfort"""
         bright_win = tk.Toplevel(self.root)
         bright_win.title("Brightness")
-        bright_win.geometry("350x180")
+        bright_win.geometry("350x220")
         bright_win.configure(bg="#2d2d30")
         
         # Header
@@ -1635,6 +1664,22 @@ class VisualEdgeReader:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
+        # Mouse wheel scrolling for library
+        def on_library_scroll(event):
+            if event.num == 4:  # Linux scroll up
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:  # Linux scroll down
+                canvas.yview_scroll(1, "units")
+            else:  # Windows/Mac
+                canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        
+        canvas.bind("<Button-4>", on_library_scroll)
+        canvas.bind("<Button-5>", on_library_scroll)
+        canvas.bind("<MouseWheel>", on_library_scroll)
+        scrollable_frame.bind("<Button-4>", on_library_scroll)
+        scrollable_frame.bind("<Button-5>", on_library_scroll)
+        scrollable_frame.bind("<MouseWheel>", on_library_scroll)
+        
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
@@ -1658,7 +1703,7 @@ class VisualEdgeReader:
                 tk.Label(scrollable_frame, text=msg, bg="#2d2d30", fg="#888", font=("Arial", 12)).pack(pady=50)
             else:
                 for book in filtered_books:
-                    self._create_book_card(scrollable_frame, book, library_win)
+                    self._create_book_card(scrollable_frame, book, library_win, on_library_scroll)
         
         # Bind search to key release
         search_var.trace_add("write", refresh_book_list)
@@ -1666,7 +1711,7 @@ class VisualEdgeReader:
         # Initial display
         refresh_book_list()
     
-    def _create_book_card(self, parent, book, library_win):
+    def _create_book_card(self, parent, book, library_win, scroll_handler=None):
         """Create a card for a book in the library with thumbnail"""
         card = tk.Frame(parent, bg="#3d3d3d", pady=10, padx=15)
         card.pack(fill=tk.X, pady=5)
@@ -1726,13 +1771,18 @@ class VisualEdgeReader:
         ttk.Button(btn_frame, text="Remove",
                   command=lambda p=book['path'], c=card: self._remove_from_library(p, c)).pack(side=tk.LEFT)
         
-        # Make card clickable
+        # Make card clickable and scrollable
         clickable_widgets = [card, info_frame] + list(info_frame.winfo_children())
         if thumbnail_label:
             clickable_widgets.append(thumbnail_label)
         for widget in clickable_widgets:
             widget.bind("<Button-1>", lambda e, p=book['path']: self._open_from_library(p, library_win))
             widget.configure(cursor="hand2")
+            # Bind scroll events
+            if scroll_handler:
+                widget.bind("<Button-4>", scroll_handler)
+                widget.bind("<Button-5>", scroll_handler)
+                widget.bind("<MouseWheel>", scroll_handler)
     
     def _add_book_to_library(self, library_win):
         """Add a new book to library"""
