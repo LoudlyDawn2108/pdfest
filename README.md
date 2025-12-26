@@ -2,6 +2,8 @@
 
 A PDF reader with text-to-speech, continuous scrolling, and library management.
 
+![Project Screenshot](screenshot/image.png)
+
 ## Features
 
 - 📖 Continuous scroll with lazy loading
