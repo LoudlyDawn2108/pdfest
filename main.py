@@ -73,6 +73,11 @@ class LibraryDB:
             cursor.execute("ALTER TABLE books ADD COLUMN footer_margin REAL DEFAULT 60")
         except sqlite3.OperationalError:
             pass
+        # Add column_mode for 1-col/2-col reading (migration)
+        try:
+            cursor.execute("ALTER TABLE books ADD COLUMN column_mode INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
     
     def get_setting(self, key, default=None):
@@ -100,7 +105,7 @@ class LibraryDB:
         self.conn.commit()
         return cursor.lastrowid
     
-    def update_book_progress(self, path, last_page, last_sentence=0, zoom_level=None, header_margin=None, footer_margin=None):
+    def update_book_progress(self, path, last_page, last_sentence=0, zoom_level=None, header_margin=None, footer_margin=None, column_mode=None):
         cursor = self.conn.cursor()
         updates = ["last_page = ?", "last_sentence = ?", "last_opened = ?"]
         params = [last_page, last_sentence, datetime.now().isoformat()]
@@ -114,6 +119,9 @@ class LibraryDB:
         if footer_margin is not None:
             updates.append("footer_margin = ?")
             params.append(footer_margin)
+        if column_mode is not None:
+            updates.append("column_mode = ?")
+            params.append(column_mode)
         
         params.append(path)
         cursor.execute(f"UPDATE books SET {', '.join(updates)} WHERE path = ?", params)
@@ -219,6 +227,9 @@ class VisualEdgeReader:
         self.header_margin = 0.0
         self.footer_margin = 0.0
         
+        # Column mode (1=single column, 2=two columns) - loaded per-book
+        self.column_mode = 1
+        
         # Brightness filter (0.0-1.0, where 1.0 is normal, lower is dimmer)
         self.brightness = float(self.db.get_setting("brightness", 1.0))
 
@@ -234,9 +245,6 @@ class VisualEdgeReader:
         ttk.Button(toolbar, text="📚 Library", command=self.show_library).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="Open PDF", command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         
-        # Voice selection
-        ttk.Button(toolbar, text="🔊 Voice", command=self.show_voice_settings).pack(side=tk.LEFT, padx=5)
-        
         # Sidebar toggle
         ttk.Button(toolbar, text="☰ TOC", command=self.toggle_sidebar).pack(side=tk.LEFT, padx=5)
         
@@ -245,12 +253,19 @@ class VisualEdgeReader:
         
         # Brightness control
         ttk.Button(toolbar, text="🌙 Dim", command=self.show_brightness_settings).pack(side=tk.LEFT, padx=5)
+        
+        # Column mode toggle (1-col / 2-col)
+        self.btn_column_mode = ttk.Button(toolbar, text="📄 1-Col", command=self.toggle_column_mode)
+        self.btn_column_mode.pack(side=tk.LEFT, padx=5)
 
         # Playback controls (right side)
         self.btn_play = ttk.Button(toolbar, text="▶ Play", command=self.toggle_play)
         self.btn_play.pack(side=tk.RIGHT, padx=10)
         ttk.Button(toolbar, text=">> Next Sent", command=self.next_sentence).pack(side=tk.RIGHT)
         ttk.Button(toolbar, text="<< Prev Sent", command=self.prev_sentence).pack(side=tk.RIGHT)
+        
+        # Voice selection (right side, next to playback)
+        ttk.Button(toolbar, text="🔊 Voice", command=self.show_voice_settings).pack(side=tk.RIGHT, padx=5)
         
         # Page navigation with zoom - centered
         page_frame = tk.Frame(toolbar, bg="#2d2d30")
@@ -418,9 +433,14 @@ class VisualEdgeReader:
             # Load per-book margins (default 50/60 for new books)
             self.header_margin = float(book_info['header_margin'] if book_info['header_margin'] is not None else 50)
             self.footer_margin = float(book_info['footer_margin'] if book_info['footer_margin'] is not None else 60)
+            # Load column mode
+            self.column_mode = int(book_info['column_mode'] if book_info['column_mode'] is not None else 1)
+            self._update_column_button()
         else:
             self.header_margin = 50.0
             self.footer_margin = 60.0
+            self.column_mode = 1
+            self._update_column_button()
         
         # Estimate total canvas height based on first page
         first_page = self.doc.load_page(0)
@@ -537,6 +557,40 @@ class VisualEdgeReader:
         """Reset page entry if it has focus"""
         if self.root.focus_get() == self.page_entry:
             self.canvas.focus_set()
+    
+    def toggle_column_mode(self):
+        """Toggle between 1-column and 2-column reading mode"""
+        if self.column_mode == 1:
+            self.column_mode = 2
+        else:
+            self.column_mode = 1
+        
+        self._update_column_button()
+        
+        # Save to database
+        if self.current_pdf_path:
+            self.db.update_book_progress(
+                self.current_pdf_path,
+                self.get_visible_page(),
+                self.current_sentence_idx,
+                column_mode=self.column_mode
+            )
+        
+        # Re-analyze sentences with new column mode
+        self.sentences.clear()
+        for page_num in self.loaded_pages:
+            page = self.doc.load_page(page_num)
+            y_offset = self.page_offsets.get(page_num, page_num * self.estimated_page_height)
+            self.analyze_page_sentences(page, page_num, y_offset)
+        
+        self.current_sentence_idx = 0
+    
+    def _update_column_button(self):
+        """Update column mode button text"""
+        if self.column_mode == 2:
+            self.btn_column_mode.config(text="📑 2-Col")
+        else:
+            self.btn_column_mode.config(text="📄 1-Col")
 
     def scroll_to_page(self, page_num):
         """Scroll the canvas to show a specific page"""
@@ -614,20 +668,33 @@ class VisualEdgeReader:
         """Extracts words and groups them into sentences with coordinates"""
         words = page.get_text("words")
         page_height = page.rect.height
+        page_width = page.rect.width
         
-        current_text = []
-        current_rects = []
-        
+        # Filter out header/footer words
+        filtered_words = []
         for w in words:
-            # w = (x0, y0, x1, y1, "word", block_no, line_no, word_no)
-            word_y = w[1]  # Y coordinate at 1x zoom
-            
-            # Skip words in header/footer margins
+            word_y = w[1]
             if self.header_margin > 0 and word_y < self.header_margin:
                 continue
             if self.footer_margin > 0 and word_y > (page_height - self.footer_margin):
                 continue
-            
+            filtered_words.append(w)
+        
+        # For 2-column mode, reorder words: left column first, then right column
+        if self.column_mode == 2:
+            midpoint = page_width / 2
+            left_words = [w for w in filtered_words if w[2] < midpoint]  # x1 < midpoint
+            right_words = [w for w in filtered_words if w[0] >= midpoint]  # x0 >= midpoint
+            # Sort each column by Y position (top to bottom), then X
+            left_words.sort(key=lambda w: (w[1], w[0]))
+            right_words.sort(key=lambda w: (w[1], w[0]))
+            # Process left column first, then right
+            filtered_words = left_words + right_words
+        
+        current_text = []
+        current_rects = []
+        
+        for w in filtered_words:
             # Scale coordinates to match our Zoom level
             rect = (w[0] * self.zoom_level, w[1] * self.zoom_level, 
                     w[2] * self.zoom_level, w[3] * self.zoom_level)
@@ -648,7 +715,18 @@ class VisualEdgeReader:
             self.sentences.append(PDFSentence(" ".join(current_text), current_rects, page_num, y_offset))
         
         # Sort sentences by page and position
-        self.sentences.sort(key=lambda s: (s.page_num, s.rects[0][1] if s.rects else 0))
+        # For 2-column mode, we need to sort by column first (X position), then Y
+        if self.column_mode == 2:
+            page_width = page.rect.width * self.zoom_level
+            midpoint = page_width / 2
+            # Sort by: page, column (left=0, right=1), then Y position
+            self.sentences.sort(key=lambda s: (
+                s.page_num,
+                0 if (s.rects and s.rects[0][0] < midpoint) else 1,  # left=0, right=1
+                s.rects[0][1] if s.rects else 0  # Y position within column
+            ))
+        else:
+            self.sentences.sort(key=lambda s: (s.page_num, s.rects[0][1] if s.rects else 0))
 
     def get_visible_page(self):
         """Determine which page is currently most visible"""
@@ -1352,9 +1430,16 @@ class VisualEdgeReader:
                 self.start_cache_worker(self.current_sentence_idx + 1)
                 
             except Exception as e:
+                error_msg = str(e)
                 print(f"TTS Error: {e}")
-                self.current_sentence_idx += 1
-                continue
+                # Stop playback and show error message
+                self.stop_signal = True
+                self.root.after(0, self._set_is_playing_false)
+                self.root.after(0, lambda: messagebox.showerror(
+                    "TTS Error", 
+                    f"Failed to generate audio.\n\nError: {error_msg}\n\nPlease check your internet connection."
+                ))
+                break
 
             while pygame.mixer.music.get_busy() and not self.stop_signal:
                 # Also check generation during playback
