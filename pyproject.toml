@@ -9,6 +9,11 @@ dependencies = [
     "pillow>=12.0.0",
     "pygame>=2.6.1",
     "pymupdf>=1.26.6",
+    "gemini-webapi>=1.17.0",
+    "browser-cookie3>=0.20.0",
+    "markdown>=3.10",
+    "pygments>=2.19.2",
+    "tkinterweb>=4.16.1",
 ]
 
 [dependency-groups]

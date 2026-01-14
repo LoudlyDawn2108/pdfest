@@ -12,6 +12,22 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageTk, ImageEnhance
+try:
+    from gemini_webapi import GeminiClient
+    from gemini_webapi.constants import Model
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    import markdown
+    from markdown.extensions.codehilite import CodeHiliteExtension
+    from markdown.extensions.fenced_code import FencedCodeExtension
+    from markdown.extensions.tables import TableExtension
+    from tkinterweb import HtmlFrame
+    MARKDOWN_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AVAILABLE = False
 
 # --- Constants ---
 DEFAULT_ZOOM = 2.5
@@ -159,6 +175,358 @@ class PDFSentence:
         self.page_num = page_num
         self.y_offset = y_offset  # Global Y offset of the page this sentence is on
 
+class MarkdownToHtml:
+    """Converts markdown to styled HTML for tkinterweb rendering"""
+    
+    # Dark theme CSS for the HTML content
+    CSS = """
+    <style>
+        body {
+            background-color: #2d2d2d;
+            color: #e0e0e0;
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+            line-height: 1.5;
+            margin: 0;
+            padding: 8px;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #ffffff;
+            margin: 8px 0;
+        }
+        h1 { font-size: 18px; }
+        h2 { font-size: 16px; }
+        h3 { font-size: 14px; }
+        p { margin: 6px 0; }
+        a { color: #4fc3f7; }
+        code {
+            background-color: #1e1e1e;
+            color: #ce9178;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
+        pre {
+            background-color: #1e1e1e;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        pre code {
+            padding: 0;
+            background: none;
+            color: #d4d4d4;
+        }
+        blockquote {
+            border-left: 3px solid #555;
+            margin: 8px 0;
+            padding-left: 12px;
+            color: #9e9e9e;
+            font-style: italic;
+        }
+        ul, ol {
+            margin: 6px 0;
+            padding-left: 25px;
+        }
+        li { margin: 3px 0; }
+        table {
+            border-collapse: collapse;
+            margin: 8px 0;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #555;
+            padding: 6px 10px;
+            text-align: left;
+        }
+        th {
+            background-color: #3d3d3d;
+            color: #ffffff;
+        }
+        tr:nth-child(even) {
+            background-color: #353535;
+        }
+        /* Syntax highlighting (Pygments) */
+        .codehilite .k { color: #569cd6; }  /* Keyword */
+        .codehilite .kn { color: #569cd6; } /* Keyword.Namespace */
+        .codehilite .kd { color: #569cd6; } /* Keyword.Declaration */
+        .codehilite .s { color: #ce9178; }  /* String */
+        .codehilite .s1 { color: #ce9178; } /* String.Single */
+        .codehilite .s2 { color: #ce9178; } /* String.Double */
+        .codehilite .c { color: #6a9955; }  /* Comment */
+        .codehilite .c1 { color: #6a9955; } /* Comment.Single */
+        .codehilite .nf { color: #dcdcaa; } /* Name.Function */
+        .codehilite .nc { color: #4ec9b0; } /* Name.Class */
+        .codehilite .n { color: #d4d4d4; }  /* Name */
+        .codehilite .o { color: #d4d4d4; }  /* Operator */
+        .codehilite .mi { color: #b5cea8; } /* Number.Integer */
+        .codehilite .mf { color: #b5cea8; } /* Number.Float */
+    </style>
+    """
+    
+    @staticmethod
+    def convert(markdown_text):
+        """Convert markdown text to styled HTML"""
+        if not MARKDOWN_AVAILABLE:
+            # Fallback: escape HTML and wrap in pre
+            import html
+            escaped = html.escape(markdown_text)
+            return f"<html><body style='background:#2d2d2d;color:#e0e0e0;font-family:Arial;padding:8px;'><pre>{escaped}</pre></body></html>"
+        
+        # Convert markdown to HTML with extensions
+        md = markdown.Markdown(extensions=[
+            'fenced_code',
+            'codehilite',
+            'tables',
+            'nl2br',
+        ], extension_configs={
+            'codehilite': {
+                'css_class': 'codehilite',
+                'guess_lang': True,
+            }
+        })
+        
+        html_content = md.convert(markdown_text)
+        
+        # Wrap with full HTML document and dark theme CSS
+        full_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            {MarkdownToHtml.CSS}
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        """
+        return full_html
+
+
+class AIPanelManager:
+    """Manages AI chat functionality using gemini-webapi"""
+    
+    def __init__(self, app):
+        self.app = app
+        self.client = None
+        self.chat_session = None
+        self.is_initialized = False
+        self.is_initializing = False
+        self.conversation_history = []  # List of (role, message) tuples for UI display
+        self.current_context = ""  # Current text context
+        self.context_type = "none"  # "selection", "page", or "none"
+        self._init_lock = threading.Lock()
+        
+        # Rich context data for selection
+        self.rich_context = {
+            "selection": "",
+            "preceding_text": "",
+            "following_text": "",
+            "page_number": 0,
+            "chapter_header": "",
+            "document_title": "",
+            "document_author": "",
+            "total_pages": 0
+        }
+        
+        # Persistent event loop for async operations
+        self._loop = None
+        self._loop_thread = None
+        
+    def _start_loop(self):
+        """Start a persistent event loop in a background thread"""
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_forever()
+        
+        self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+        self._loop_thread.start()
+        # Give the loop time to start
+        import time
+        time.sleep(0.1)
+    
+    def _run_async(self, coro):
+        """Run an async coroutine in the persistent event loop"""
+        if self._loop is None:
+            raise RuntimeError("Event loop not started")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=300)  # 300 second timeout
+    
+    def initialize_async(self, callback=None):
+        """Initialize Gemini client with browser cookies in background thread"""
+        if not GEMINI_AVAILABLE:
+            if callback:
+                self.app.root.after(0, lambda: callback(False, "Gemini library not available"))
+            return
+            
+        with self._init_lock:
+            if self.is_initialized or self.is_initializing:
+                if callback:
+                    self.app.root.after(0, lambda: callback(self.is_initialized, None))
+                return
+            self.is_initializing = True
+        
+        def init_thread():
+            try:
+                # Start persistent event loop
+                if self._loop is None:
+                    self._start_loop()
+                
+                # GeminiClient() uses browser-cookie3 automatically
+                self.client = GeminiClient()
+                self._run_async(self.client.init(timeout=300, auto_close=False, auto_refresh=True))
+                
+                self.is_initialized = True
+                self.is_initializing = False
+                
+                if callback:
+                    self.app.root.after(0, lambda: callback(True, None))
+            except Exception as e:
+                self.is_initializing = False
+                error_msg = str(e)
+                if callback:
+                    self.app.root.after(0, lambda: callback(False, error_msg))
+        
+        thread = threading.Thread(target=init_thread, daemon=True)
+        thread.start()
+    
+    def _build_structured_prompt(self, message):
+        """Build a structured XML-style prompt with rich context"""
+        if self.context_type == "none" or not self.current_context:
+            return message
+        
+        ctx = self.rich_context
+        
+        # Build document metadata section
+        doc_meta = f"""<document_metadata>
+    <title>{ctx.get('document_title', 'Unknown')}</title>
+    <author>{ctx.get('document_author', 'Unknown')}</author>
+    <total_pages>{ctx.get('total_pages', 0)}</total_pages>
+</document_metadata>"""
+        
+        # Build current view context
+        view_ctx = f"""<current_view_context>
+    <page_number>{ctx.get('page_number', 0) + 1}</page_number>
+    <chapter_header>{ctx.get('chapter_header', 'N/A')}</chapter_header>
+</current_view_context>"""
+        
+        if self.context_type == "selection":
+            # Build selection context with surrounding text
+            selection_ctx = f"""<user_selection_context>
+    <preceding_text>
+    {ctx.get('preceding_text', '')[:1000]}
+    </preceding_text>
+
+    <target_selection>
+    {ctx.get('selection', '')}
+    </target_selection>
+
+    <following_text>
+    {ctx.get('following_text', '')[:500]}
+    </following_text>
+</user_selection_context>"""
+            
+            prompt = f"""{doc_meta}
+
+{view_ctx}
+
+{selection_ctx}
+
+Question: {message}"""
+        else:
+            # Page context - simpler structure
+            prompt = f"""{doc_meta}
+
+{view_ctx}
+
+<page_content>
+{self.current_context[:3000]}
+</page_content>
+
+Question: {message}"""
+        
+        return prompt
+    
+    def send_message_async(self, message, callback=None):
+        """Send a message to Gemini and get response asynchronously"""
+        if not self.is_initialized:
+            if callback:
+                self.app.root.after(0, lambda: callback(None, "AI not initialized"))
+            return
+        
+        # Build structured prompt with context
+        prompt = self._build_structured_prompt(message)
+        
+        # Add user message to history
+        self.conversation_history.append(("user", message))
+        
+        def send_thread():
+            try:
+                if self.chat_session is None:
+                    self.chat_session = self.client.start_chat(model=Model.G_3_0_PRO)
+                
+                response = self._run_async(self.chat_session.send_message(prompt))
+                response_text = response.text if response.text else "No response received."
+                
+                # Add AI response to history
+                self.conversation_history.append(("ai", response_text))
+                
+                if callback:
+                    self.app.root.after(0, lambda: callback(response_text, None))
+            except Exception as e:
+                error_msg = str(e)
+                if callback:
+                    self.app.root.after(0, lambda: callback(None, error_msg))
+        
+        thread = threading.Thread(target=send_thread, daemon=True)
+        thread.start()
+    
+    def set_context(self, text, context_type="selection"):
+        """Set the current context for AI queries"""
+        self.current_context = text
+        self.context_type = context_type
+    
+    def set_rich_context(self, selection, preceding_text, following_text, 
+                         page_number, chapter_header, doc_title, doc_author, total_pages):
+        """Set rich context with surrounding text and metadata"""
+        self.context_type = "selection"
+        self.current_context = selection
+        self.rich_context = {
+            "selection": selection,
+            "preceding_text": preceding_text,
+            "following_text": following_text,
+            "page_number": page_number,
+            "chapter_header": chapter_header,
+            "document_title": doc_title,
+            "document_author": doc_author,
+            "total_pages": total_pages
+        }
+    
+    def clear_context(self):
+        """Clear the current context"""
+        self.current_context = ""
+        self.context_type = "none"
+        self.rich_context = {
+            "selection": "",
+            "preceding_text": "",
+            "following_text": "",
+            "page_number": 0,
+            "chapter_header": "",
+            "document_title": "",
+            "document_author": "",
+            "total_pages": 0
+        }
+    
+    def clear_conversation(self):
+        """Clear conversation history and start fresh"""
+        self.conversation_history = []
+        self.chat_session = None
+
+
 
 class VisualEdgeReader:
     def __init__(self, root):
@@ -232,6 +600,13 @@ class VisualEdgeReader:
         
         # Brightness filter (0.0-1.0, where 1.0 is normal, lower is dimmer)
         self.brightness = float(self.db.get_setting("brightness", 1.0))
+        
+        # AI Panel state
+        self.ai_manager = AIPanelManager(self)
+        self.ai_panel_visible = False
+        saved_ai_width = self.db.get_setting("ai_panel_width", 350)
+        self.ai_panel_width = int(saved_ai_width)
+        self.ai_is_loading = False
 
         # Init Audio
         pygame.mixer.init()
@@ -257,6 +632,10 @@ class VisualEdgeReader:
         # Column mode toggle (1-col / 2-col)
         self.btn_column_mode = ttk.Button(toolbar, text="📄 1-Col", command=self.toggle_column_mode)
         self.btn_column_mode.pack(side=tk.LEFT, padx=5)
+        
+        # AI Panel toggle
+        self.btn_ai = ttk.Button(toolbar, text="🤖 AI", command=self.toggle_ai_panel)
+        self.btn_ai.pack(side=tk.LEFT, padx=5)
 
         # Playback controls (right side)
         self.btn_play = ttk.Button(toolbar, text="▶ Play", command=self.toggle_play)
@@ -351,6 +730,9 @@ class VisualEdgeReader:
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # --- AI Panel (Right Sidebar) ---
+        self._create_ai_panel()
 
         # Bind scroll events for lazy loading and page tracking
         self.canvas.bind("<Configure>", self.on_canvas_configure)
@@ -368,14 +750,25 @@ class VisualEdgeReader:
         self.root.bind("<Control-c>", self.copy_selection)
         
         # Keyboard shortcuts for TTS and navigation
-        self.root.bind("<p>", lambda e: self.toggle_play())
-        self.root.bind("<space>", lambda e: self.toggle_play())
-        self.root.bind("<j>", lambda e: self.scroll_down())
-        self.root.bind("<k>", lambda e: self.scroll_up())
-        self.root.bind("<h>", lambda e: self.prev_sentence())
-        self.root.bind("<l>", lambda e: self.next_sentence())
-        self.root.bind("<t>", lambda e: self.toggle_sidebar())
-        self.root.bind("<o>", lambda e: self.show_library())
+        # These shortcuts should not fire when typing in a text field
+        def bind_shortcut(key, action):
+            def handler(event):
+                # Check if focus is on a text entry widget
+                focused = self.root.focus_get()
+                if isinstance(focused, (tk.Entry, tk.Text)):
+                    return  # Don't trigger shortcut when typing
+                action()
+            self.root.bind(key, handler)
+        
+        bind_shortcut("<p>", self.toggle_play)
+        bind_shortcut("<space>", self.toggle_play)
+        bind_shortcut("<j>", self.scroll_down)
+        bind_shortcut("<k>", self.scroll_up)
+        bind_shortcut("<h>", self.prev_sentence)
+        bind_shortcut("<l>", self.next_sentence)
+        bind_shortcut("<t>", self.toggle_sidebar)
+        bind_shortcut("<a>", self.toggle_ai_panel)
+        bind_shortcut("<o>", self.show_library)
 
     # --- Property for is_playing with auto UI update ---
     @property
@@ -503,6 +896,444 @@ class VisualEdgeReader:
             self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.sidebar_visible = True
     
+    def _create_ai_panel(self):
+        """Create the AI assistant panel (right sidebar)"""
+        # AI Panel resize handle (left edge)
+        self.ai_resize_handle = tk.Frame(self.main_frame, bg="#444", width=5, cursor="sb_h_double_arrow")
+        self.ai_resize_handle.bind("<Button-1>", self._start_ai_panel_resize)
+        self.ai_resize_handle.bind("<B1-Motion>", self._do_ai_panel_resize)
+        self.ai_resize_handle.bind("<ButtonRelease-1>", self._end_ai_panel_resize)
+        self.ai_panel_resizing = False
+        
+        # AI Panel container (hidden by default)
+        self.ai_panel = tk.Frame(self.main_frame, bg="#2d2d30", width=self.ai_panel_width)
+        self.ai_panel.pack_propagate(False)
+        
+        # AI Panel header
+        ai_header = tk.Frame(self.ai_panel, bg="#1e1e1e")
+        ai_header.pack(fill=tk.X)
+        tk.Label(ai_header, text="🤖 AI Assistant", bg="#1e1e1e", fg="white",
+                font=("Arial", 10, "bold"), pady=5).pack(side=tk.LEFT, padx=10)
+        ttk.Button(ai_header, text="✕", width=3, command=self.toggle_ai_panel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(ai_header, text="🗑", width=3, command=self.clear_ai_conversation).pack(side=tk.RIGHT)
+        
+        # Context indicator
+        self.ai_context_frame = tk.Frame(self.ai_panel, bg="#3d3d3d", pady=5)
+        self.ai_context_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Pack buttons FIRST (right side) so they get priority
+        context_btn_frame = tk.Frame(self.ai_context_frame, bg="#3d3d3d")
+        context_btn_frame.pack(side=tk.RIGHT, padx=5)
+        ttk.Button(context_btn_frame, text="📄 Page", width=7, 
+                   command=self.use_current_page_context).pack(side=tk.LEFT, padx=2)
+        ttk.Button(context_btn_frame, text="✕", width=3,
+                   command=self.clear_ai_context).pack(side=tk.LEFT)
+        
+        # Then pack label to fill remaining space
+        self.ai_context_label = tk.Label(self.ai_context_frame, text="📝 No context selected", 
+                                         bg="#3d3d3d", fg="#aaa", font=("Arial", 9),
+                                         anchor=tk.W, justify=tk.LEFT)
+        self.ai_context_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Chat history area (scrollable)
+        chat_container = tk.Frame(self.ai_panel, bg="#2d2d30")
+        chat_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        chat_scroll = tk.Scrollbar(chat_container)
+        chat_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.ai_chat_canvas = tk.Canvas(chat_container, bg="#1a1a1a", 
+                                        yscrollcommand=chat_scroll.set,
+                                        highlightthickness=0)
+        self.ai_chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        chat_scroll.config(command=self.ai_chat_canvas.yview)
+        
+        # Bind mouse wheel scrolling to chat canvas
+        self.ai_chat_canvas.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+        self.ai_chat_canvas.bind("<Button-4>", self._on_ai_chat_mousewheel)  # Linux scroll up
+        self.ai_chat_canvas.bind("<Button-5>", self._on_ai_chat_mousewheel)  # Linux scroll down
+        
+        self.ai_chat_frame = tk.Frame(self.ai_chat_canvas, bg="#1a1a1a")
+        self.ai_chat_window_id = self.ai_chat_canvas.create_window((0, 0), window=self.ai_chat_frame, anchor=tk.NW)
+        self.ai_chat_frame.bind("<Configure>", self._on_ai_chat_configure)
+        
+        # Bind canvas resize to update chat frame width
+        self.ai_chat_canvas.bind("<Configure>", self._on_ai_canvas_resize)
+        
+        # Also bind mousewheel on the chat frame for when hovering over messages
+        self.ai_chat_frame.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+        self.ai_chat_frame.bind("<Button-4>", self._on_ai_chat_mousewheel)
+        self.ai_chat_frame.bind("<Button-5>", self._on_ai_chat_mousewheel)
+        
+        # Welcome message
+        self._add_ai_message("ai", "Hello! I'm your AI assistant. Select text or use the current page as context, then ask me any questions about what you're reading.")
+        
+        # Input area
+        input_frame = tk.Frame(self.ai_panel, bg="#2d2d30", pady=5)
+        input_frame.pack(fill=tk.X, padx=5, pady=(0, 10))
+        
+        self.ai_input = tk.Text(input_frame, height=3, bg="#3d3d3d", fg="white",
+                                insertbackground="white", relief=tk.FLAT,
+                                font=("Arial", 10), wrap=tk.WORD)
+        self.ai_input.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.ai_input.bind("<Control-Return>", self.send_ai_query)
+        self.ai_input.bind("<Shift-Return>", lambda e: None)  # Allow shift+enter for newlines
+        
+        # Send button and status
+        send_frame = tk.Frame(input_frame, bg="#2d2d30")
+        send_frame.pack(fill=tk.X, padx=5)
+        
+        self.ai_status_label = tk.Label(send_frame, text="Ctrl+Enter to send", 
+                                        bg="#2d2d30", fg="#666", font=("Arial", 8))
+        self.ai_status_label.pack(side=tk.LEFT)
+        
+        self.ai_send_btn = ttk.Button(send_frame, text="Send", command=self.send_ai_query)
+        self.ai_send_btn.pack(side=tk.RIGHT)
+    
+    def _on_ai_chat_mousewheel(self, event):
+        """Handle mouse wheel scrolling in AI chat"""
+        # Linux uses Button-4 (up) and Button-5 (down)
+        if event.num == 4:
+            self.ai_chat_canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.ai_chat_canvas.yview_scroll(3, "units")
+        else:
+            # Windows/Mac
+            self.ai_chat_canvas.yview_scroll(int(-1 * (event.delta / 40)), "units")
+        return "break"
+    
+    def _start_ai_panel_resize(self, event):
+        """Start resizing AI panel"""
+        self.ai_panel_resizing = True
+        self.ai_resize_start_x = event.x_root
+        self.ai_resize_start_width = self.ai_panel_width
+    
+    def _do_ai_panel_resize(self, event):
+        """Handle AI panel resize drag"""
+        if not self.ai_panel_resizing:
+            return
+        delta = self.ai_resize_start_x - event.x_root  # Reversed because panel is on right
+        new_width = max(250, min(600, self.ai_resize_start_width + delta))
+        self.ai_panel_width = new_width
+        self.ai_panel.config(width=new_width)
+    
+    def _end_ai_panel_resize(self, event):
+        """End AI panel resize and save width"""
+        self.ai_panel_resizing = False
+        self.db.set_setting("ai_panel_width", self.ai_panel_width)
+    
+    def _on_ai_chat_configure(self, event):
+        """Update scroll region when chat content changes"""
+        self.ai_chat_canvas.configure(scrollregion=self.ai_chat_canvas.bbox("all"))
+        # Don't auto-scroll here - it breaks manual scrolling
+    
+    def _on_ai_canvas_resize(self, event):
+        """Update chat frame width when canvas is resized"""
+        # Make the chat frame fill the canvas width
+        self.ai_chat_canvas.itemconfig(self.ai_chat_window_id, width=event.width)
+        # Update scroll region
+        self.ai_chat_canvas.configure(scrollregion=self.ai_chat_canvas.bbox("all"))
+        
+        # Recalculate text widget heights after resize
+        self._recalc_chat_heights()
+    
+    def toggle_ai_panel(self):
+        """Toggle AI panel visibility"""
+        if self.ai_panel_visible:
+            self.ai_panel.pack_forget()
+            self.ai_resize_handle.pack_forget()
+            self.ai_panel_visible = False
+        else:
+            # Re-pack everything in correct order
+            self.canvas_frame.pack_forget()
+            self.ai_resize_handle.pack(side=tk.RIGHT, fill=tk.Y)
+            self.ai_panel.pack(side=tk.RIGHT, fill=tk.Y)
+            self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.ai_panel_visible = True
+            
+            # Initialize AI if not already done
+            if not self.ai_manager.is_initialized and not self.ai_manager.is_initializing:
+                self._init_ai_client()
+    
+    def _recalc_chat_heights(self):
+        """Recalculate text widget heights after panel resize"""
+        if not hasattr(self, '_chat_text_widgets'):
+            return
+        
+        for text_widget, message in self._chat_text_widgets:
+            try:
+                if not text_widget.winfo_exists():
+                    continue
+                text_widget.config(state=tk.NORMAL)
+                text_widget.update_idletasks()
+                
+                # Recalculate display lines
+                try:
+                    display_lines = text_widget.count("1.0", "end", "displaylines")
+                    if display_lines:
+                        num_lines = display_lines[0]
+                    else:
+                        widget_width = max(30, text_widget.winfo_width() // 8)
+                        num_lines = max(1, (len(message) // widget_width) + message.count('\n') + 1)
+                except:
+                    num_lines = max(1, (len(message) // 30) + message.count('\n') + 1)
+                
+                text_widget.config(height=num_lines, state=tk.DISABLED)
+            except:
+                pass
+        
+        # Update scroll region
+        self.ai_chat_frame.update_idletasks()
+        self.ai_chat_canvas.configure(scrollregion=self.ai_chat_canvas.bbox("all"))
+    
+    def _init_ai_client(self):
+        """Initialize the AI client"""
+        self.ai_status_label.config(text="Connecting to Gemini...", fg="#ffa500")
+        
+        def on_init_complete(success, error):
+            if success:
+                self.ai_status_label.config(text="Ready! Ctrl+Enter to send", fg="#4CAF50")
+            else:
+                self.ai_status_label.config(text=f"Error: {error[:50]}...", fg="#f44336")
+                self._add_ai_message("ai", f"⚠️ Failed to connect to Gemini: {error}\n\nMake sure you're logged into gemini.google.com in your browser.")
+        
+        self.ai_manager.initialize_async(callback=on_init_complete)
+    
+    def _add_ai_message(self, role, message):
+        """Add a message to the chat history UI"""
+        # Message container - full width with padding
+        msg_frame = tk.Frame(self.ai_chat_frame, bg="#1a1a1a", pady=3)
+        msg_frame.pack(fill=tk.X, padx=8)
+        
+        # Role label
+        if role == "user":
+            role_label = tk.Label(msg_frame, text="You:", bg="#1a1a1a", fg="#6bb3f8",
+                                  font=("Arial", 9, "bold"), anchor=tk.W)
+            role_label.pack(fill=tk.X)
+            bg_color = "#1e3a5f"  # Dark blue for user
+            select_bg = "#2a5a8f"
+            
+            # User messages use Text widget
+            text_widget = tk.Text(msg_frame, bg=bg_color, fg="white",
+                                  font=("Arial", 10), wrap=tk.WORD,
+                                  relief=tk.FLAT, borderwidth=0, padx=8, pady=6,
+                                  highlightthickness=0, cursor="arrow",
+                                  height=1,
+                                  selectbackground=select_bg, selectforeground="white")
+            text_widget.pack(fill=tk.X, expand=True)
+            text_widget.insert("1.0", message)
+            
+            # Calculate display lines
+            text_widget.update_idletasks()
+            try:
+                display_lines = text_widget.count("1.0", "end", "displaylines")
+                if display_lines:
+                    num_lines = display_lines[0]
+                else:
+                    num_lines = max(1, (len(message) // 30) + message.count('\n') + 1)
+            except:
+                num_lines = max(1, (len(message) // 30) + message.count('\n') + 1)
+            
+            text_widget.config(height=num_lines, state=tk.DISABLED)
+            
+            # Bind mousewheel
+            text_widget.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+            text_widget.bind("<Button-4>", self._on_ai_chat_mousewheel)
+            text_widget.bind("<Button-5>", self._on_ai_chat_mousewheel)
+            
+            # Store for resize
+            if not hasattr(self, '_chat_text_widgets'):
+                self._chat_text_widgets = []
+            self._chat_text_widgets.append((text_widget, message))
+        else:
+            role_label = tk.Label(msg_frame, text="AI:", bg="#1a1a1a", fg="#8bc34a",
+                                  font=("Arial", 9, "bold"), anchor=tk.W)
+            role_label.pack(fill=tk.X)
+            
+            # AI messages use HtmlFrame if available
+            if MARKDOWN_AVAILABLE:
+                html_content = MarkdownToHtml.convert(message)
+                
+                # Estimate height based on content
+                line_count = message.count('\n') + 1
+                estimated_height = max(80, min(400, line_count * 20 + 50))
+                
+                html_frame = HtmlFrame(msg_frame, messages_enabled=False)
+                html_frame.load_html(html_content)
+                html_frame.pack(fill=tk.X, expand=True)
+                html_frame.configure(height=estimated_height)
+                
+                # Bind mousewheel for scrolling parent
+                html_frame.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+                html_frame.bind("<Button-4>", self._on_ai_chat_mousewheel)
+                html_frame.bind("<Button-5>", self._on_ai_chat_mousewheel)
+            else:
+                # Fallback to Text widget
+                text_widget = tk.Text(msg_frame, bg="#2d2d2d", fg="white",
+                                      font=("Arial", 10), wrap=tk.WORD,
+                                      relief=tk.FLAT, borderwidth=0, padx=8, pady=6,
+                                      highlightthickness=0, cursor="arrow", height=1)
+                text_widget.pack(fill=tk.X, expand=True)
+                text_widget.insert("1.0", message)
+                
+                text_widget.update_idletasks()
+                num_lines = max(1, (len(message) // 30) + message.count('\n') + 1)
+                text_widget.config(height=num_lines, state=tk.DISABLED)
+                
+                text_widget.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+                text_widget.bind("<Button-4>", self._on_ai_chat_mousewheel)
+                text_widget.bind("<Button-5>", self._on_ai_chat_mousewheel)
+        
+        # Update scroll region
+        self.ai_chat_frame.update_idletasks()
+        self.ai_chat_canvas.configure(scrollregion=self.ai_chat_canvas.bbox("all"))
+        self.ai_chat_canvas.yview_moveto(1.0)
+    
+    def send_ai_query(self, event=None):
+        """Send the current input to AI"""
+        if self.ai_is_loading:
+            return "break"
+        
+        question = self.ai_input.get("1.0", tk.END).strip()
+        if not question:
+            return "break"
+        
+        # Clear input
+        self.ai_input.delete("1.0", tk.END)
+        
+        # Add user message to UI
+        self._add_ai_message("user", question)
+        
+        # Show loading state
+        self.ai_is_loading = True
+        self.ai_status_label.config(text="Thinking...", fg="#ffa500")
+        self.ai_send_btn.config(state=tk.DISABLED)
+        
+        def on_response(response, error):
+            self.ai_is_loading = False
+            self.ai_send_btn.config(state=tk.NORMAL)
+            
+            if error:
+                self.ai_status_label.config(text=f"Error occurred", fg="#f44336")
+                self._add_ai_message("ai", f"⚠️ Error: {error}")
+            else:
+                self.ai_status_label.config(text="Ready! Ctrl+Enter to send", fg="#4CAF50")
+                self._add_ai_message("ai", response)
+        
+        self.ai_manager.send_message_async(question, callback=on_response)
+        return "break"
+    
+    def update_ai_context(self, text, context_type="selection"):
+        """Update the AI context with selected text"""
+        self.ai_manager.set_context(text, context_type)
+        
+        # Update context label
+        preview = text[:80].replace('\n', ' ').strip()
+        if len(text) > 80:
+            preview += "..."
+        
+        if context_type == "selection":
+            self.ai_context_label.config(text=f"📝 Selection: {preview}", fg="white")
+        else:
+            self.ai_context_label.config(text=f"📄 Page: {preview}", fg="white")
+    
+    def update_ai_context_rich(self, selection, preceding_text, following_text, page_num):
+        """Update AI context with rich surrounding context"""
+        # Get document metadata
+        doc_title, doc_author = self._get_document_metadata()
+        chapter_header = self._get_chapter_for_page(page_num)
+        
+        self.ai_manager.set_rich_context(
+            selection=selection,
+            preceding_text=preceding_text,
+            following_text=following_text,
+            page_number=page_num,
+            chapter_header=chapter_header,
+            doc_title=doc_title,
+            doc_author=doc_author,
+            total_pages=self.total_pages
+        )
+        
+        # Update context label
+        preview = selection[:80].replace('\n', ' ').strip()
+        if len(selection) > 80:
+            preview += "..."
+        self.ai_context_label.config(text=f"📝 Selection: {preview}", fg="white")
+    
+    def _get_document_metadata(self):
+        """Extract document title and author from PDF metadata"""
+        if not self.doc:
+            return "Unknown", "Unknown"
+        
+        metadata = self.doc.metadata
+        title = metadata.get("title", "") or Path(self.current_pdf_path).stem if self.current_pdf_path else "Unknown"
+        author = metadata.get("author", "") or "Unknown"
+        return title, author
+    
+    def _get_chapter_for_page(self, page_num):
+        """Get the chapter/section header for a given page"""
+        if not self.toc:
+            return f"Page {page_num + 1}"
+        
+        # Find the latest TOC entry that's at or before this page
+        current_chapter = "Beginning"
+        for level, title, toc_page in self.toc:
+            if toc_page <= page_num:
+                current_chapter = title
+            else:
+                break
+        return current_chapter
+    
+    def use_current_page_context(self):
+        """Use the current visible page as AI context"""
+        if not self.doc:
+            return
+        
+        page_num = self.get_visible_page()
+        page = self.doc.load_page(page_num)
+        text = page.get_text("text")
+        
+        if text.strip():
+            # For page context, also set document metadata
+            doc_title, doc_author = self._get_document_metadata()
+            chapter_header = self._get_chapter_for_page(page_num)
+            
+            self.ai_manager.set_context(text.strip(), "page")
+            self.ai_manager.rich_context.update({
+                "page_number": page_num,
+                "chapter_header": chapter_header,
+                "document_title": doc_title,
+                "document_author": doc_author,
+                "total_pages": self.total_pages
+            })
+            
+            preview = text[:80].replace('\n', ' ').strip()
+            if len(text) > 80:
+                preview += "..."
+            self.ai_context_label.config(text=f"📄 Page: {preview}", fg="white")
+        else:
+            self.ai_context_label.config(text="📄 No text found on this page", fg="#ff6b6b")
+    
+    def clear_ai_context(self):
+        """Clear the AI context"""
+        self.ai_manager.clear_context()
+        self.ai_context_label.config(text="📝 No context selected", fg="#aaa")
+    
+    def clear_ai_conversation(self):
+        """Clear the AI conversation history"""
+        self.ai_manager.clear_conversation()
+        
+        # Clear widget tracking list
+        self._chat_text_widgets = []
+        
+        # Clear chat UI
+        for widget in self.ai_chat_frame.winfo_children():
+            widget.destroy()
+        
+        # Add welcome message
+        self._add_ai_message("ai", "Conversation cleared. How can I help you?")
+
+
     def on_toc_select(self, event):
         """Handle TOC item selection"""
         selection = self.toc_listbox.curselection()
@@ -1049,6 +1880,7 @@ class VisualEdgeReader:
         x_offset = max(0, (canvas_width - self.page_width) // 2)
         
         selected_texts = []
+        selection_page_num = None
         self.canvas.delete("selection")
         
         # Find pages that intersect with selection
@@ -1062,6 +1894,10 @@ class VisualEdgeReader:
             # Check if selection intersects this page
             if sel_bottom < page_top or sel_top > page_bottom:
                 continue
+            
+            # Track which page the selection is on (use first page if multi-page)
+            if selection_page_num is None:
+                selection_page_num = page_num
             
             # Convert canvas coords to page coords
             page_sel_left = (sel_left - x_offset) / self.zoom_level
@@ -1099,6 +1935,54 @@ class VisualEdgeReader:
         
         self.selected_text = "\n".join(selected_texts)
         self.selection_start = None
+        
+        # Update AI context with rich surrounding context
+        if self.selected_text.strip() and selection_page_num is not None:
+            preceding_text, following_text = self._get_surrounding_text(
+                selection_page_num, sel_top, sel_bottom, x_offset
+            )
+            self.update_ai_context_rich(
+                self.selected_text.strip(),
+                preceding_text,
+                following_text,
+                selection_page_num
+            )
+    
+    def _get_surrounding_text(self, page_num, sel_top_canvas, sel_bottom_canvas, x_offset):
+        """Get text before and after the selection on the same page"""
+        if not self.doc:
+            return "", ""
+        
+        page = self.doc.load_page(page_num)
+        page_y_offset = self.page_offsets.get(page_num, 0)
+        page_height = page.rect.height
+        page_width = page.rect.width
+        
+        # Convert canvas coords to page coords
+        sel_top_page = (sel_top_canvas - page_y_offset) / self.zoom_level
+        sel_bottom_page = (sel_bottom_canvas - page_y_offset) / self.zoom_level
+        
+        # Get preceding text (from top of page to selection start)
+        preceding_rect = fitz.Rect(0, 0, page_width, max(0, sel_top_page))
+        preceding_text = page.get_text("text", clip=preceding_rect)
+        
+        # If not enough preceding text, also get from previous page
+        if len(preceding_text) < 500 and page_num > 0:
+            prev_page = self.doc.load_page(page_num - 1)
+            prev_text = prev_page.get_text("text")
+            preceding_text = prev_text[-800:] + "\n" + preceding_text
+        
+        # Get following text (from selection end to bottom of page)
+        following_rect = fitz.Rect(0, min(page_height, sel_bottom_page), page_width, page_height)
+        following_text = page.get_text("text", clip=following_rect)
+        
+        # If not enough following text, also get from next page
+        if len(following_text) < 200 and page_num < self.total_pages - 1:
+            next_page = self.doc.load_page(page_num + 1)
+            next_text = next_page.get_text("text")
+            following_text = following_text + "\n" + next_text[:500]
+        
+        return preceding_text[-1000:], following_text[:500]
     
     def copy_selection(self, event=None):
         """Copy selected text to clipboard"""
