@@ -74,6 +74,16 @@ class LibraryDB:
                 value TEXT
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                metadata TEXT,
+                preview TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
         # Add zoom_level column if it doesn't exist (migration)
         try:
             cursor.execute("ALTER TABLE books ADD COLUMN zoom_level REAL DEFAULT 2.5")
@@ -92,6 +102,11 @@ class LibraryDB:
         # Add column_mode for 1-col/2-col reading (migration)
         try:
             cursor.execute("ALTER TABLE books ADD COLUMN column_mode INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        # Add messages column to chat_sessions (migration)
+        try:
+            cursor.execute("ALTER TABLE chat_sessions ADD COLUMN messages TEXT")
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
@@ -161,6 +176,62 @@ class LibraryDB:
     def remove_book(self, path):
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM books WHERE path = ?", (path,))
+        self.conn.commit()
+    
+    # Chat session methods
+    def save_chat_session(self, title, metadata_json, preview="", messages_json=""):
+        """Create a new chat session"""
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO chat_sessions (title, metadata, preview, messages, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (title, metadata_json, preview, messages_json, now, now))
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def update_chat_session(self, session_id, metadata_json, preview=None, title=None, messages_json=None):
+        """Update an existing chat session"""
+        cursor = self.conn.cursor()
+        updates = ["metadata = ?", "updated_at = ?"]
+        params = [metadata_json, datetime.now().isoformat()]
+        
+        if preview is not None:
+            updates.append("preview = ?")
+            params.append(preview)
+        if title is not None:
+            updates.append("title = ?")
+            params.append(title)
+        if messages_json is not None:
+            updates.append("messages = ?")
+            params.append(messages_json)
+        
+        params.append(session_id)
+        cursor.execute(f"UPDATE chat_sessions SET {', '.join(updates)} WHERE id = ?", params)
+        self.conn.commit()
+    
+    def get_all_chat_sessions(self):
+        """Get all chat sessions ordered by updated_at desc"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM chat_sessions ORDER BY updated_at DESC")
+        return cursor.fetchall()
+    
+    def get_latest_chat_session(self):
+        """Get the most recently updated chat session"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM chat_sessions ORDER BY updated_at DESC LIMIT 1")
+        return cursor.fetchone()
+    
+    def get_chat_session(self, session_id):
+        """Get a specific chat session"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,))
+        return cursor.fetchone()
+    
+    def delete_chat_session(self, session_id):
+        """Delete a chat session"""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
         self.conn.commit()
     
     def close(self):
@@ -320,6 +391,9 @@ class AIPanelManager:
         self.context_type = "none"  # "selection", "page", or "none"
         self._init_lock = threading.Lock()
         
+        # Chat session persistence
+        self.current_session_id = None  # Database ID of current session
+        
         # Rich context data for selection
         self.rich_context = {
             "selection": "",
@@ -475,6 +549,9 @@ Question: {message}"""
                 # Add AI response to history
                 self.conversation_history.append(("ai", response_text))
                 
+                # Schedule save on main thread (SQLite is not thread-safe)
+                self.app.root.after(0, self.save_current_session)
+                
                 if callback:
                     self.app.root.after(0, lambda: callback(response_text, None))
             except Exception as e:
@@ -521,10 +598,66 @@ Question: {message}"""
             "total_pages": 0
         }
     
-    def clear_conversation(self):
-        """Clear conversation history and start fresh"""
+    def save_current_session(self):
+        """Save current chat session to database"""
+        if self.chat_session is None or not self.conversation_history:
+            return
+        
+        import json
+        metadata_json = json.dumps(self.chat_session.metadata)
+        messages_json = json.dumps(self.conversation_history)
+        
+        # Generate title from first user message
+        first_user_msg = next((msg for role, msg in self.conversation_history if role == "user"), "New Chat")
+        title = first_user_msg[:50] + "..." if len(first_user_msg) > 50 else first_user_msg
+        
+        # Preview from last message
+        if self.conversation_history:
+            last_role, last_msg = self.conversation_history[-1]
+            preview = last_msg[:100] + "..." if len(last_msg) > 100 else last_msg
+        else:
+            preview = ""
+        
+        if self.current_session_id is None:
+            # Create new session
+            self.current_session_id = self.app.db.save_chat_session(title, metadata_json, preview, messages_json)
+        else:
+            # Update existing session
+            self.app.db.update_chat_session(self.current_session_id, metadata_json, preview, messages_json=messages_json)
+    
+    def load_session(self, session_id):
+        """Load a chat session from database"""
+        import json
+        session = self.app.db.get_chat_session(session_id)
+        if session is None:
+            return False, []
+        
+        metadata = json.loads(session['metadata']) if session['metadata'] else None
+        try:
+            messages = json.loads(session['messages']) if session['messages'] else []
+        except (KeyError, TypeError):
+            messages = []
+        
+        if metadata and self.client:
+            self.chat_session = self.client.start_chat(metadata=metadata, model=Model.G_3_0_PRO)
+            self.current_session_id = session_id
+            self.conversation_history = messages
+            return True, messages
+        return False, []
+    
+    def start_new_session(self):
+        """Start a fresh chat session"""
+        # Save current session first
+        self.save_current_session()
+        
+        # Reset state
         self.conversation_history = []
         self.chat_session = None
+        self.current_session_id = None
+    
+    def clear_conversation(self):
+        """Clear conversation history and start fresh"""
+        self.start_new_session()
 
 
 
@@ -618,7 +751,7 @@ class VisualEdgeReader:
         toolbar.pack(fill=tk.X)
 
         ttk.Button(toolbar, text="📚 Library", command=self.show_library).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="Open PDF", command=self.open_pdf).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text="📖 Open", command=self.open_document).pack(side=tk.LEFT, padx=5)
         
         # Sidebar toggle
         ttk.Button(toolbar, text="☰ TOC", command=self.toggle_sidebar).pack(side=tk.LEFT, padx=5)
@@ -785,9 +918,14 @@ class VisualEdgeReader:
             else:
                 self.btn_play.config(text="▶ Play")
 
-    def open_pdf(self, filename=None):
+    def open_document(self, filename=None):
+        """Open a PDF or EPUB document"""
         if filename is None:
-            filename = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+            filename = filedialog.askopenfilename(filetypes=[
+                ("Ebook Files", "*.pdf *.epub"),
+                ("PDF Files", "*.pdf"),
+                ("EPUB Files", "*.epub")
+            ])
         if not filename or not os.path.exists(filename):
             return
         
@@ -808,6 +946,15 @@ class VisualEdgeReader:
         self.stop_signal = True
         
         self.doc = fitz.open(filename)
+        
+        # For reflowable documents (EPUB, HTML, etc.), set a fixed page layout
+        # This makes them render uniformly like PDF pages
+        if self.doc.is_reflowable:
+            # Use A4-like dimensions in points for consistent page rendering
+            page_width = 595   # ~8.3 inches (A4 width)
+            page_height = 842  # ~11.7 inches (A4 height)
+            self.doc.layout(width=page_width, height=page_height, fontsize=13)
+        
         self.total_pages = len(self.doc)
         self.current_pdf_path = filename
         
@@ -915,7 +1062,8 @@ class VisualEdgeReader:
         tk.Label(ai_header, text="🤖 AI Assistant", bg="#1e1e1e", fg="white",
                 font=("Arial", 10, "bold"), pady=5).pack(side=tk.LEFT, padx=10)
         ttk.Button(ai_header, text="✕", width=3, command=self.toggle_ai_panel).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(ai_header, text="🗑", width=3, command=self.clear_ai_conversation).pack(side=tk.RIGHT)
+        ttk.Button(ai_header, text="📋", width=3, command=self.show_chat_history).pack(side=tk.RIGHT)
+        ttk.Button(ai_header, text="➕", width=3, command=self.new_ai_chat).pack(side=tk.RIGHT)
         
         # Context indicator
         self.ai_context_frame = tk.Frame(self.ai_panel, bg="#3d3d3d", pady=5)
@@ -994,12 +1142,12 @@ class VisualEdgeReader:
         """Handle mouse wheel scrolling in AI chat"""
         # Linux uses Button-4 (up) and Button-5 (down)
         if event.num == 4:
-            self.ai_chat_canvas.yview_scroll(-3, "units")
+            self.ai_chat_canvas.yview_scroll(-1, "units")
         elif event.num == 5:
-            self.ai_chat_canvas.yview_scroll(3, "units")
+            self.ai_chat_canvas.yview_scroll(1, "units")
         else:
             # Windows/Mac
-            self.ai_chat_canvas.yview_scroll(int(-1 * (event.delta / 40)), "units")
+            self.ai_chat_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
     
     def _start_ai_panel_resize(self, event):
@@ -1013,7 +1161,7 @@ class VisualEdgeReader:
         if not self.ai_panel_resizing:
             return
         delta = self.ai_resize_start_x - event.x_root  # Reversed because panel is on right
-        new_width = max(250, min(600, self.ai_resize_start_width + delta))
+        new_width = max(250, min(1000, self.ai_resize_start_width + delta))
         self.ai_panel_width = new_width
         self.ai_panel.config(width=new_width)
     
@@ -1156,17 +1304,20 @@ class VisualEdgeReader:
                 
                 # Estimate height based on content
                 line_count = message.count('\n') + 1
-                estimated_height = max(80, min(400, line_count * 20 + 50))
+                message_height = line_count * 20 + 40
+                estimated_height = max(80, min(700, message_height))
                 
                 html_frame = HtmlFrame(msg_frame, messages_enabled=False)
                 html_frame.load_html(html_content)
                 html_frame.pack(fill=tk.X, expand=True)
                 html_frame.configure(height=estimated_height)
+
+                # Bind mousewheel for scrolling parent if message height is less than estimated height
+                if message_height <= estimated_height:
+                    html_frame.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
+                    html_frame.bind("<Button-4>", self._on_ai_chat_mousewheel)
+                    html_frame.bind("<Button-5>", self._on_ai_chat_mousewheel)
                 
-                # Bind mousewheel for scrolling parent
-                html_frame.bind("<MouseWheel>", self._on_ai_chat_mousewheel)
-                html_frame.bind("<Button-4>", self._on_ai_chat_mousewheel)
-                html_frame.bind("<Button-5>", self._on_ai_chat_mousewheel)
             else:
                 # Fallback to Text widget
                 text_widget = tk.Text(msg_frame, bg="#2d2d2d", fg="white",
@@ -1319,9 +1470,9 @@ class VisualEdgeReader:
         self.ai_manager.clear_context()
         self.ai_context_label.config(text="📝 No context selected", fg="#aaa")
     
-    def clear_ai_conversation(self):
-        """Clear the AI conversation history"""
-        self.ai_manager.clear_conversation()
+    def new_ai_chat(self):
+        """Start a new AI chat session"""
+        self.ai_manager.start_new_session()
         
         # Clear widget tracking list
         self._chat_text_widgets = []
@@ -1331,7 +1482,91 @@ class VisualEdgeReader:
             widget.destroy()
         
         # Add welcome message
-        self._add_ai_message("ai", "Conversation cleared. How can I help you?")
+        self._add_ai_message("ai", "New conversation started. How can I help you?")
+    
+    def show_chat_history(self):
+        """Show dialog to select from previous chat sessions"""
+        sessions = self.db.get_all_chat_sessions()
+        
+        if not sessions:
+            messagebox.showinfo("Chat History", "No previous chat sessions found.")
+            return
+        
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Chat History")
+        dialog.geometry("400x500")
+        dialog.configure(bg="#2d2d30")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Header
+        tk.Label(dialog, text="Select a conversation:", bg="#2d2d30", fg="white",
+                font=("Arial", 11, "bold")).pack(pady=10)
+        
+        # Listbox with scrollbar
+        list_frame = tk.Frame(dialog, bg="#2d2d30")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        listbox = tk.Listbox(list_frame, bg="#1e1e1e", fg="white", font=("Arial", 10),
+                            selectbackground="#0078d7", yscrollcommand=scrollbar.set)
+        listbox.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+        
+        # Populate list
+        session_ids = []
+        for session in sessions:
+            title = session['title'] or "Untitled"
+            preview = session['preview'] or ""
+            date = session['updated_at'][:10] if session['updated_at'] else ""
+            display_text = f"{title[:40]}... ({date})" if len(title) > 40 else f"{title} ({date})"
+            listbox.insert(tk.END, display_text)
+            session_ids.append(session['id'])
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg="#2d2d30")
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        def load_selected():
+            selection = listbox.curselection()
+            if selection:
+                session_id = session_ids[selection[0]]
+                self._load_chat_session(session_id)
+                dialog.destroy()
+        
+        def delete_selected():
+            selection = listbox.curselection()
+            if selection:
+                if messagebox.askyesno("Delete Chat", "Delete this conversation?"):
+                    session_id = session_ids[selection[0]]
+                    self.db.delete_chat_session(session_id)
+                    listbox.delete(selection[0])
+                    session_ids.pop(selection[0])
+        
+        ttk.Button(btn_frame, text="Load", command=load_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Delete", command=delete_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def _load_chat_session(self, session_id):
+        """Load a chat session from database and update UI"""
+        success, messages = self.ai_manager.load_session(session_id)
+        if success:
+            # Clear current UI
+            self._chat_text_widgets = []
+            for widget in self.ai_chat_frame.winfo_children():
+                widget.destroy()
+            
+            # Restore previous messages to UI
+            if messages:
+                for role, msg in messages:
+                    self._add_ai_message(role, msg)
+            else:
+                self._add_ai_message("ai", "Previous conversation loaded. Continue chatting or ask a new question.")
+        else:
+            messagebox.showerror("Error", "Failed to load chat session.")
 
 
     def on_toc_select(self, event):
@@ -1384,10 +1619,9 @@ class VisualEdgeReader:
         self.page_entry.insert(0, str(visible_page + 1))
         self.page_entry_original = str(visible_page + 1)
     
-    def reset_page_entry_focus(self):
-        """Reset page entry if it has focus"""
-        if self.root.focus_get() == self.page_entry:
-            self.canvas.focus_set()
+    def reset_canvas_focus(self):
+        """Reset canvas focus"""
+        self.canvas.focus_set()
     
     def toggle_column_mode(self):
         """Toggle between 1-column and 2-column reading mode"""
@@ -1670,12 +1904,12 @@ class VisualEdgeReader:
     
     def scroll_down(self):
         """Scroll down - for keyboard shortcut"""
-        self.reset_page_entry_focus()
+        self.reset_canvas_focus()
         self.smooth_scroll(120)
     
     def scroll_up(self):
         """Scroll up - for keyboard shortcut"""
-        self.reset_page_entry_focus()
+        self.reset_canvas_focus()
         self.smooth_scroll(-120)
 
     def on_mousewheel(self, event):
@@ -1689,7 +1923,7 @@ class VisualEdgeReader:
             delta = -1 * (event.delta // 2)
         
         # Reset page entry if focused
-        self.reset_page_entry_focus()
+        self.reset_canvas_focus()
         
         # Start smooth scroll animation
         self.smooth_scroll(delta)
@@ -1763,7 +1997,7 @@ class VisualEdgeReader:
     def on_selection_start(self, event):
         """Start text selection"""
         # Reset page entry if focused
-        self.reset_page_entry_focus()
+        self.reset_canvas_focus()
         
         # Clear previous selection
         self.canvas.delete("selection")
@@ -2600,7 +2834,7 @@ class VisualEdgeReader:
         
         # Create library window
         library_win = tk.Toplevel(self.root)
-        library_win.title("PDF Library")
+        library_win.title("Library")
         library_win.geometry("800x600")
         library_win.configure(bg="#2d2d30")
         
@@ -2609,7 +2843,7 @@ class VisualEdgeReader:
         header.pack(fill=tk.X)
         tk.Label(header, text="📚 Your Library", bg="#1e1e1e", fg="white",
                 font=("Arial", 16, "bold")).pack(side=tk.LEFT, padx=20)
-        ttk.Button(header, text="+ Add PDF", command=lambda: self._add_book_to_library(library_win)).pack(side=tk.RIGHT, padx=20)
+        ttk.Button(header, text="+ Add Book", command=lambda: self._add_book_to_library(library_win)).pack(side=tk.RIGHT, padx=20)
         
         # Search box
         search_frame = tk.Frame(library_win, bg="#2d2d30", pady=10)
@@ -2666,7 +2900,7 @@ class VisualEdgeReader:
             
             if not filtered_books:
                 if not all_books:
-                    msg = "No books in library.\nClick '+ Add PDF' to add your first book."
+                    msg = "No books in library.\nClick '+ Add Book' to add your first book."
                 else:
                     msg = "No books match your search."
                 tk.Label(scrollable_frame, text=msg, bg="#2d2d30", fg="#888", font=("Arial", 12)).pack(pady=50)
@@ -2755,10 +2989,17 @@ class VisualEdgeReader:
     
     def _add_book_to_library(self, library_win):
         """Add a new book to library"""
-        filename = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        filename = filedialog.askopenfilename(filetypes=[
+            ("Ebook Files", "*.pdf *.epub"),
+            ("PDF Files", "*.pdf"),
+            ("EPUB Files", "*.epub")
+        ])
         if filename:
             # Add to database
             doc = fitz.open(filename)
+            # For reflowable documents (EPUB), apply layout to get page count
+            if doc.is_reflowable:
+                doc.layout(width=595, height=842, fontsize=13)
             self.db.add_book(filename, total_pages=len(doc))
             doc.close()
             # Refresh library view
@@ -2773,7 +3014,7 @@ class VisualEdgeReader:
         if path == self.current_pdf_path and self.doc:
             return
         
-        self.open_pdf(path)
+        self.open_document(path)
     
     def _remove_from_library(self, path, card):
         """Remove a book from library"""
@@ -2869,6 +3110,9 @@ class VisualEdgeReader:
     def on_app_close(self):
         """Handle app close - save progress and cleanup"""
         self.save_current_progress()
+        # Save AI chat session
+        if hasattr(self, 'ai_manager'):
+            self.ai_manager.save_current_session()
         self.db.close()
         pygame.mixer.quit()
         self.root.destroy()
@@ -2884,7 +3128,7 @@ if __name__ == "__main__":
     # Auto-open last book on startup
     last_book = app.db.get_last_opened_book()
     if last_book and os.path.exists(last_book['path']):
-        root.after(100, lambda: app.open_pdf(last_book['path']))
+        root.after(100, lambda: app.open_document(last_book['path']))
     
     root.mainloop()
 
