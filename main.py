@@ -1067,8 +1067,12 @@ class VisualEdgeReader:
         bind_shortcut("<k>", self.scroll_up)
         bind_shortcut("<h>", self.prev_sentence)
         bind_shortcut("<l>", self.next_sentence)
+        bind_shortcut("<s>", self.scroll_down)
+        bind_shortcut("<w>", self.scroll_up)
+        bind_shortcut("<a>", self.prev_sentence)
+        bind_shortcut("<d>", self.next_sentence)
         bind_shortcut("<t>", self.toggle_sidebar)
-        bind_shortcut("<a>", self.toggle_ai_panel)
+        bind_shortcut("<c>", self.toggle_ai_panel)
         bind_shortcut("<o>", self.show_library)
 
     # --- Property for is_playing with auto UI update ---

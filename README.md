@@ -16,7 +16,7 @@ A PDF reader with text-to-speech, continuous scrolling, and library management.
 - 🌙 Brightness filter (dim mode for eye comfort)
 - 🔗 Clickable links (opens in browser)
 - 📋 Text selection and copy
-- ⌨️ Vim-style keyboard shortcuts
+- ⌨️ Vim-style and WASD keyboard shortcuts
 - 🤖 AI integration via Gemini web
 
 ## Keyboard Shortcuts
@@ -31,7 +31,11 @@ A PDF reader with text-to-speech, continuous scrolling, and library management.
 | **t** | Toggle TOC sidebar |
 | **o** | Open library |
 | **Ctrl+C** | Copy selected text |
-| **a** | Open AI chat |
+| **s** | Scroll down |
+| **w** | Scroll up |
+| **d** | Next sentence |
+| **a** | Previous sentence |
+| **c** | Open AI chat |
 
 # Warning
 
@@ -82,8 +86,8 @@ Click **📚 Library** or press **o**:
 - Click links to open in browser or jump to page
 
 ### AI Chat
-
-- Click **🤖 AI** or press **a**:
+**Note:** To use this feature, you must login to Gemini at google.gemini.com and it will automatically save your cookies.
+- Click **🤖 AI** or press **c**:
 - Select text to send context to AI
 - Hold **Alt** to select as image
 
