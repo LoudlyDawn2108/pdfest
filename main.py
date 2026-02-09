@@ -44,6 +44,16 @@ PAGE_GAP = 10  # Pixels between pages
 SENTENCE_ENDINGS = re.compile(r"(?<=[.!?])\s+")
 DATA_DIR = Path.home() / ".local" / "pdfest"
 DEFAULT_SIDEBAR_WIDTH = 300
+HYPHEN_CHARS = {
+    "-",  # 0x2D Hyphen-minus
+    "‐",  # 0x2010 Hyphen
+    "‑",  # 0x2011 Non-breaking hyphen
+    "‒",  # 0x2012 Figure dash
+    "–",  # 0x2013 En dash
+    "—",  # 0x2014 Em dash
+    "―",  # 0x2015 Horizontal bar
+    "\u00AD",  # Soft hyphen
+}
 
 
 class LibraryDB:
@@ -2106,6 +2116,9 @@ class VisualEdgeReader:
         current_text = []
         current_rects = []
 
+        last_block_no = -1
+        pending_merge = False
+
         for w in filtered_words:
             # Scale coordinates to match our Zoom level
             rect = (
@@ -2115,18 +2128,69 @@ class VisualEdgeReader:
                 w[3] * self.zoom_level,
             )
             text = w[4]
+            # Ensure we have block number (w[5])
+            block_no = w[5] if len(w) > 5 else -1
 
-            current_text.append(text)
-            current_rects.append(rect)
+            # Check for block change - force sentence break
+            if block_no != last_block_no and last_block_no != -1:
+                if current_text:
+                    full_sentence = " ".join(current_text)
+                    self.sentences.append(
+                        PDFSentence(full_sentence, current_rects, page_num, y_offset)
+                    )
+                    current_text = []
+                    current_rects = []
+                    pending_merge = False
+            last_block_no = block_no
 
-            # Check for sentence ending
-            if re.search(r"[.!?]$", text):
-                full_sentence = " ".join(current_text)
-                self.sentences.append(
-                    PDFSentence(full_sentence, current_rects, page_num, y_offset)
-                )
-                current_text = []
-                current_rects = []
+            # Handle hyphenation merging
+            if pending_merge and current_text:
+                # Append to the last word instead of adding a new one
+                current_text[-1] += text
+                # Still add the rect so we highlight both parts of the word
+                current_rects.append(rect)
+                pending_merge = False
+                
+                # After merging, check if this completes a sentence
+                # We check the 'text' (suffix) for punctuation
+                if re.search(r"[.!?]$", text):
+                    full_sentence = " ".join(current_text)
+                    self.sentences.append(
+                        PDFSentence(full_sentence, current_rects, page_num, y_offset)
+                    )
+                    current_text = []
+                    current_rects = []
+            else:
+                # Check if this word ends with a hyphen (and isn't just a hyphen itself)
+                # Check for various hyphen types
+                is_hyphenated = False
+                hyphen_char = ""
+                
+                if len(text) > 1:
+                    last_char = text[-1]
+                    if last_char in HYPHEN_CHARS:
+                        is_hyphenated = True
+                        hyphen_char = last_char
+
+                if is_hyphenated:
+                    # Strip hyphen and mark for merge
+                    # Handle soft hyphen separately if needed, but usually just stripping acts as join
+                    current_text.append(text[:-1])
+                    current_rects.append(rect)
+                    pending_merge = True
+                    # Do not check for sentence end on hyphenated part
+                else:
+                    current_text.append(text)
+                    current_rects.append(rect)
+
+                    # Check for sentence ending
+                    if re.search(r"[.!?]$", text):
+                        full_sentence = " ".join(current_text)
+                        self.sentences.append(
+                            PDFSentence(full_sentence, current_rects, page_num, y_offset)
+                        )
+                        current_text = []
+                        current_rects = []
 
         # Add any remaining text as a sentence
         if current_text:

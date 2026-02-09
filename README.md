@@ -17,6 +17,7 @@ A PDF reader with text-to-speech, continuous scrolling, and library management.
 - 🔗 Clickable links (opens in browser)
 - 📋 Text selection and copy
 - ⌨️ Vim-style keyboard shortcuts
+- 🤖 AI integration via Gemini web
 
 ## Keyboard Shortcuts
 
@@ -30,6 +31,7 @@ A PDF reader with text-to-speech, continuous scrolling, and library management.
 | **t** | Toggle TOC sidebar |
 | **o** | Open library |
 | **Ctrl+C** | Copy selected text |
+| **a** | Open AI chat |
 
 # Warning
 
@@ -78,6 +80,12 @@ Click **📚 Library** or press **o**:
 
 - Click and drag to select text, **Ctrl+C** to copy
 - Click links to open in browser or jump to page
+
+### AI Chat
+
+- Click **🤖 AI** or press **a**:
+- Select text to send context to AI
+- Hold **Alt** to select as image
 
 ## Development
 
